@@ -9,6 +9,10 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+app.get('/', (_req, res) => {
+  res.send('NoteAI backend is running ✅  See /health');
+});
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
