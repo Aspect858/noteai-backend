@@ -50,7 +50,14 @@ app.post('/auth/google/exchange', async (req, res) => {
     params.append('client_id', CLIENT_ID);
     params.append('client_secret', CLIENT_SECRET);
     params.append('grant_type', 'authorization_code');
-    if (redirectUri) params.append('redirect_uri', redirectUri);
+    // ... wcześniej
+    const params = new URLSearchParams();
+    params.append('code', code);
+    params.append('client_id', CLIENT_ID);
+    params.append('client_secret', CLIENT_SECRET);
+    params.append('grant_type', 'authorization_code');
+    // DO NOT append redirect_uri for Android serverAuthCode exchange
+
 
     const tokenResp = await fetch(tokenUrl, {
       method: 'POST',
