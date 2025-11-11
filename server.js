@@ -62,7 +62,7 @@ app.post('/auth/google/exchange', async (req, res) => {
     console.log('[AUTH] token exchange resp status=', tokenResp.status, 'body=', tokenText.slice(0, 2000));
 
     if (!tokenResp.ok) {
-      // Return Google body for debugging (this is why you saw invalid_grant / unauthorized_client)
+      // Return Google body for debugging
       return res.status(502).json({ error: 'Token exchange failed', status: tokenResp.status, body: tokenText });
     }
 
@@ -125,7 +125,6 @@ app.get('/auth/me', async (req, res) => {
 
 /* ---------- LOGOUT ---------- */
 app.post('/auth/logout', async (req, res) => {
-  // If you track server sessions, destroy it here
   res.json({ success: true });
 });
 
@@ -158,7 +157,7 @@ app.post('/api/ask', async (req, res) => {
       notes = rows;
     }
 
-    const context = buildContext(notes);
+    const context = buildContext(notes, 10000);
     const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
@@ -166,34 +165,61 @@ app.post('/api/ask', async (req, res) => {
       return res.status(500).json({ error: 'Server misconfigured (no GEMINI_API_KEY)' });
     }
 
+    // Tunable tokens & temperature
+    const maxTokens = Number(process.env.GEMINI_MAX_TOKENS ?? 256);
+    const temperature = Number(process.env.GEMINI_TEMPERATURE ?? 0.2);
+
     const prompt = `You are a helpful assistant that may use private notes. Question: ${question}\n\nNotes:\n${context}\n\nAnswer concisely.`;
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
     const payload = {
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: Number(process.env.GEMINI_TEMPERATURE ?? 0.2), maxOutputTokens: Number(process.env.GEMINI_MAX_TOKENS ?? 1024) }
+      generationConfig: { temperature, maxOutputTokens: maxTokens }
     };
 
-    const t0 = Date.now();
-    const upstream = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    const elapsed = Date.now() - t0;
-    const raw = await upstream.text();
-    console.log('[ASK] Gemini status=', upstream.status, 'time_ms=', elapsed, 'raw_len=', raw?.length ?? 0);
+    // Abortable fetch with timeout
+    const controller = new AbortController();
+    const timeoutMs = Number(process.env.GEMINI_TIMEOUT_MS ?? 60_000); // default 60s
+    const to = setTimeout(() => controller.abort(), timeoutMs);
 
-    if (!upstream.ok) {
-      console.error('[ASK] Gemini upstream error', upstream.status, raw.slice(0, 2000));
-      return res.status(502).json({ error: 'Gemini upstream error', status: upstream.status, body: raw });
+    try {
+      const t0 = Date.now();
+      const upstream = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      const elapsed = Date.now() - t0;
+      const raw = await upstream.text();
+      console.log('[ASK] Gemini status=', upstream.status, 'time_ms=', elapsed, 'raw_len=', raw?.length ?? 0);
+
+      if (!upstream.ok) {
+        console.error('[ASK] Gemini upstream error', upstream.status, raw.slice(0, 2000));
+        return res.status(502).json({ error: 'Gemini upstream error', status: upstream.status, body: raw });
+      }
+
+      let data;
+      try { data = JSON.parse(raw); } catch (e) {
+        console.error('[ASK] Gemini parse error', e, raw.slice(0, 2000));
+        return res.status(502).json({ error: 'Invalid Gemini response', raw });
+      }
+
+      const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+      const cleaned = stripSources(answer);
+      console.log('[ASK] ok -> answer_len=', cleaned.length);
+      return res.json({ answer: cleaned });
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        console.error('[ASK] Gemini request aborted (timeout)');
+        return res.status(504).json({ error: 'Gemini timeout' });
+      } else {
+        console.error('[ASK] Gemini fetch error', e);
+        return res.status(500).json({ error: 'internal', message: String(e) });
+      }
+    } finally {
+      clearTimeout(to);
     }
 
-    let data;
-    try { data = JSON.parse(raw); } catch (e) {
-      console.error('[ASK] Gemini parse error', e, raw.slice(0, 2000));
-      return res.status(502).json({ error: 'Invalid Gemini response', raw });
-    }
-
-    const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-    const cleaned = stripSources(answer);
-    console.log('[ASK] ok -> answer_len=', cleaned.length);
-    return res.json({ answer: cleaned });
   } catch (e) {
     console.error('[ASK] unexpected', e);
     return res.status(500).json({ error: 'Internal error' });
