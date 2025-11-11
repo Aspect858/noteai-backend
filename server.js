@@ -1,87 +1,101 @@
-// server.js  (ESM, gotowy pod Render)
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import morgan from 'morgan';
-import { OAuth2Client } from 'google-auth-library';
+// server.js (ESM, Node 22)
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
+import { OAuth2Client } from "google-auth-library";
 
+// === env (Render) ===
 const {
-  PORT = 8080,
-  NODE_ENV = 'production',
-  GOOGLE_OAUTH_CLIENT_ID: WEB_CLIENT_ID,
-  GOOGLE_OAUTH_CLIENT_SECRET: WEB_CLIENT_SECRET,
+  GOOGLE_OAUTH_CLIENT_ID: CLIENT_ID,
+  GOOGLE_OAUTH_CLIENT_SECRET: CLIENT_SECRET,
+  NODE_ENV,
+  PORT,
 } = process.env;
 
-if (!WEB_CLIENT_ID || !WEB_CLIENT_SECRET) {
-  console.error('[BOOT] Missing GOOGLE_OAUTH_CLIENT_ID or GOOGLE_OAUTH_CLIENT_SECRET');
+if (!CLIENT_ID || !CLIENT_SECRET) {
+  console.error("[BOOT] Missing GOOGLE_OAUTH_CLIENT_ID or GOOGLE_OAUTH_CLIENT_SECRET");
   process.exit(1);
 }
 
-// <<< KLUCZOWE: redirect_uri = 'postmessage' dla kodu z Androida
-const oauth2 = new OAuth2Client(WEB_CLIENT_ID, WEB_CLIENT_SECRET, 'postmessage');
-
 const app = express();
-app.use(cors({ origin: '*', credentials: false }));
-app.use(express.urlencoded({ extended: false }));         // form-urlencoded (Android/Retrofit)
-app.use(express.json());
-app.use(morgan(NODE_ENV === 'production' ? 'combined' : 'dev'));
+app.use(cors({ origin: "*"}));
+app.use(bodyParser.json());
 
-app.get('/healthz', (_req, res) => res.status(200).send('ok'));
+// ——— utilities ———
+function mapGoogleExchangeError(e) {
+  // przydatne logi do diagnozy bez wysadzania 500
+  const code = e?.response?.status;
+  const data = e?.response?.data;
+  if (code === 400 && data?.error === "invalid_grant") {
+    return { status: 400, body: { error: "invalid_grant", detail: data } };
+  }
+  if (code === 401) {
+    return { status: 401, body: { error: "unauthorized_client", detail: data } };
+  }
+  return { status: 502, body: { error: "oauth_exchange_failed", detail: data || String(e) } };
+}
 
-// Wymiana serverAuthCode -> tokeny Google + profil
-app.post('/auth/google/exchange', async (req, res) => {
+// ——— /auth/google/exchange ———
+// body: { code: "<serverAuthCode from Android>" }
+app.post("/auth/google/exchange", async (req, res) => {
   try {
-    const code = (req.body.code || '').trim();
-    if (!code) return res.status(400).json({ error: 'missing_code' });
+    const { code } = req.body || {};
+    if (!code) return res.status(400).json({ error: "missing_code" });
 
-    // google-auth-library samo dośle redirect_uri=postmessage
-    const { tokens } = await oauth2.getToken(code);
-
-    if (!tokens?.access_token) {
-      return res.status(400).json({ error: 'invalid_grant', detail: 'no access_token' });
-    }
-
-    // Pobierz profil przez /userinfo (bez manualnego verifyIdToken — unikasz błędu zegara)
-    const uResp = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
-      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    // Uwaga: redirect_uri MUSI być 'postmessage' przy wymianie kodu z GoogleSignIn (Android/iOS)
+    const oauth = new OAuth2Client({
+      clientId: CLIENT_ID,
+      clientSecret: CLIENT_SECRET,
+      redirectUri: "postmessage",
     });
 
-    if (!uResp.ok) {
-      const body = await uResp.text();
-      return res.status(401).json({ error: 'unauthorized', detail: body });
-    }
+    const { tokens } = await oauth.getToken({ code, redirect_uri: "postmessage" });
+    // tokens: { access_token, id_token, refresh_token?, expires_in, scope, token_type }
+    // Często refresh_token pojawia się tylko przy pierwszym logowaniu lub gdy forceCodeForRefreshToken=true (u Ciebie jest true)
+    // Możesz tu zrobić lookup/create usera w DB bazując na id_token (sub)
 
-    const profile = await uResp.json();
-
-    // Jeżeli masz własny JWT – tu go wystaw. Na szybko użyjemy id_token/access_token jako serverToken.
-    const serverToken = tokens.id_token ?? tokens.access_token;
-
-    return res.status(200).json({
-      token: serverToken,
-      user: {
-        id: profile.sub,
-        email: profile.email,
-        name: profile.name,
-        picture: profile.picture,
-      },
-    });
-  } catch (err) {
-    const msg = err?.response?.data || err?.message || String(err);
-    // Zmapuj typowe błędy na 4xx, żeby nie widzieć 502 w aplikacji
-    if (String(msg).includes('invalid_grant')) {
-      return res.status(400).json({ error: 'invalid_grant', detail: msg });
-    }
-    if (String(msg).includes('unauthorized_client')) {
-      return res.status(401).json({ error: 'unauthorized_client', detail: msg });
-    }
-    console.error('[AUTH] exchange failed', err);
-    return res.status(500).json({ error: 'exchange_failed', detail: msg });
+    return res.json({ ok: true, tokens });
+  } catch (e) {
+    console.error("[AUTH] exchange failed", e?.response?.status, e?.response?.data || e);
+    const mapped = mapGoogleExchangeError(e);
+    return res.status(mapped.status).json(mapped.body);
   }
 });
 
-// (opcjonalnie) prosty root
-app.get('/', (_req, res) => res.redirect('/healthz'));
+// ——— przykładowe zabezpieczenie do /api/ask ———
+// jeśli wysyłasz idToken w nagłówku Authorization: Bearer <idToken>
+async function getUserFromIdToken(idToken) {
+  try {
+    const oauth = new OAuth2Client(CLIENT_ID);
+    const ticket = await oauth.verifyIdToken({ idToken, audience: CLIENT_ID });
+    return ticket.getPayload(); // { sub, email, name, picture, ... }
+  } catch {
+    return null;
+  }
+}
 
-app.listen(PORT, () => {
-  console.log(`API listening on http://0.0.0.0:${PORT}`);
+app.post("/api/ask", async (req, res) => {
+  // minimalny "auth"
+  const auth = req.headers.authorization || "";
+  const idToken = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  const user = idToken ? await getUserFromIdToken(idToken) : null;
+
+  if (!user) {
+    // nie zabijaj 500 – frontend dostanie sensowny błąd
+    return res.status(401).json({ error: "No user" });
+  }
+
+  // ... tutaj Twój kod do Gemini (zostawiam jak masz) ...
+  // ważne: timeouts/reties – ustaw rozsądny timeout klienta HTTP (30s) i logi odpowiedzi
+
+  return res.json({ ok: true /*, answer */ });
+});
+
+// health/ping
+app.get("/", (_, res) => res.status(404).send("ok"));
+app.get("/healthz", (_, res) => res.send("ok"));
+
+const listenPort = Number(PORT || 8080);
+app.listen(listenPort, () => {
+  console.log(`[BOOT] API listening on http://0.0.0.0:${listenPort}`);
 });
