@@ -1,4 +1,4 @@
-// backend/server.js  (ESM, self-contained)
+// backend/server.js  (ES module)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -13,10 +13,10 @@ app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan(':method :url :status :res[content-length] - :response-time ms'));
 
-// simple health
+/* ---------- SIMPLE HEALTH ---------- */
 app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-/* ---------- DATABASE (optional) ---------- */
+/* ---------- OPTIONAL DATABASE ---------- */
 let pool = null;
 if (process.env.DATABASE_URL) {
   pool = new Pool({
@@ -28,46 +28,41 @@ if (process.env.DATABASE_URL) {
   console.log('[DB] DATABASE_URL not set - running without DB (ask will use empty notes)');
 }
 
-/* ---------- AUTH ---------- */
+/* ---------- AUTH (Google token exchange) ---------- */
 const CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
-const oauthClient = new OAuth2Client(CLIENT_ID);
+const oauthClient = CLIENT_ID ? new OAuth2Client(CLIENT_ID) : null;
 
-// POST /auth/google/exchange
 app.post('/auth/google/exchange', async (req, res) => {
   try {
-    const { code, redirectUri } = req.body || {};
+    const { code } = req.body || {};
     if (!code) return res.status(400).json({ error: 'Missing code' });
 
     if (!CLIENT_ID || !CLIENT_SECRET) {
-      console.error('[AUTH] Missing GOOGLE_OAUTH_CLIENT_ID/CLIENT_SECRET');
+      console.error('[AUTH] Missing GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET');
       return res.status(500).json({ error: 'Server misconfigured (oauth client)' });
     }
 
+    // Build form params once (avoid duplicate declarations)
     const tokenUrl = 'https://oauth2.googleapis.com/token';
-    const params = new URLSearchParams();
-    params.append('code', code);
-    params.append('client_id', CLIENT_ID);
-    params.append('client_secret', CLIENT_SECRET);
-    params.append('grant_type', 'authorization_code');
-    // ... wcześniej
-    const params = new URLSearchParams();
-    params.append('code', code);
-    params.append('client_id', CLIENT_ID);
-    params.append('client_secret', CLIENT_SECRET);
-    params.append('grant_type', 'authorization_code');
-    // DO NOT append redirect_uri for Android serverAuthCode exchange
-
+    const tokenParams = new URLSearchParams();
+    tokenParams.append('code', code);
+    tokenParams.append('client_id', CLIENT_ID);
+    tokenParams.append('client_secret', CLIENT_SECRET);
+    tokenParams.append('grant_type', 'authorization_code');
+    // IMPORTANT: Do NOT append redirect_uri for Android serverAuthCode flows
 
     const tokenResp = await fetch(tokenUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
+      body: tokenParams.toString(),
     });
 
     const tokenText = await tokenResp.text();
+    console.log('[AUTH] token exchange resp status=', tokenResp.status, 'body=', tokenText.slice(0, 2000));
+
     if (!tokenResp.ok) {
-      console.error('[AUTH] token exchange failed', tokenResp.status, tokenText);
+      // Return Google body for debugging (this is why you saw invalid_grant / unauthorized_client)
       return res.status(502).json({ error: 'Token exchange failed', status: tokenResp.status, body: tokenText });
     }
 
@@ -80,67 +75,79 @@ app.post('/auth/google/exchange', async (req, res) => {
       return res.status(502).json({ error: 'No id_token in token response', raw: tokenJson });
     }
 
-    // Verify id_token with Google
-    const ticket = await oauthClient.verifyIdToken({ idToken, audience: CLIENT_ID });
-    const payload = ticket.getPayload();
-    if (!payload) {
-      console.error('[AUTH] verifyIdToken returned empty payload');
-      return res.status(502).json({ error: 'Invalid id_token' });
-    }
+    // Verify id_token server-side
+    try {
+      if (!oauthClient) throw new Error('OAuth client not configured');
+      const ticket = await oauthClient.verifyIdToken({ idToken, audience: CLIENT_ID });
+      const payload = ticket.getPayload();
+      if (!payload) {
+        console.error('[AUTH] verifyIdToken returned empty payload');
+        return res.status(502).json({ error: 'Invalid id_token' });
+      }
 
-    const userId = payload.sub;
-    const email = payload.email;
-    console.log('[AUTH] exchange ok for', userId, email);
-    return res.json({ success: true, user: { userId, email }, token: idToken, accessToken });
-  } catch (e) {
-    console.error('[AUTH] /google/exchange error', e);
+      const userId = payload.sub;
+      const email = payload.email;
+      console.log('[AUTH] exchange ok for', userId, email);
+
+      // TODO: create session / save user into DB
+      return res.json({ success: true, user: { userId, email }, token: idToken, accessToken });
+    } catch (verifyErr) {
+      console.error('[AUTH] verifyIdToken error', verifyErr);
+      return res.status(502).json({ error: 'id_token_verify_failed', message: String(verifyErr) });
+    }
+  } catch (err) {
+    console.error('[AUTH] /google/exchange error', err);
     return res.status(500).json({ error: 'Internal error' });
   }
 });
 
-// GET /auth/me
+/* ---------- AUTH CHECK ---------- */
 app.get('/auth/me', async (req, res) => {
   try {
     const auth = req.headers.authorization || req.headers.Authorization;
-    if (!auth || !auth.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Missing Authorization' });
-    }
+    if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing Authorization' });
     const idToken = auth.slice(7);
-    const ticket = await oauthClient.verifyIdToken({ idToken, audience: CLIENT_ID });
-    const payload = ticket.getPayload();
-    if (!payload || !payload.sub) return res.status(401).json({ error: 'Invalid token' });
-    return res.json({ success: true, user: { userId: payload.sub, email: payload.email } });
+    if (!CLIENT_ID) return res.status(500).json({ error: 'Server misconfigured (oauth client)' });
+    try {
+      const ticket = await oauthClient.verifyIdToken({ idToken, audience: CLIENT_ID });
+      const payload = ticket.getPayload();
+      if (!payload || !payload.sub) return res.status(401).json({ error: 'Invalid token' });
+      return res.json({ success: true, user: { userId: payload.sub, email: payload.email } });
+    } catch (e) {
+      console.error('[AUTH] /me verify error', e);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
   } catch (e) {
     console.error('[AUTH] /me error', e);
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(500).json({ error: 'Internal error' });
   }
 });
 
-// POST /auth/logout
+/* ---------- LOGOUT ---------- */
 app.post('/auth/logout', async (req, res) => {
-  // If you store sessions server-side, destroy them here.
+  // If you track server sessions, destroy it here
   res.json({ success: true });
 });
 
 /* ---------- ASK (Gemini) ---------- */
-function buildContext(notes, limitChars = 12000) {
-  const joined = (notes || []).map(n => `# ${n.title ?? ''}\n${n.body ?? ''}`).join('\n\n---\n\n');
+function buildContext(notes = [], limitChars = 12000) {
+  const joined = notes.map(n => `# ${n.title ?? ''}\n${n.body ?? ''}`).join('\n\n---\n\n');
   return joined.length > limitChars ? joined.slice(0, limitChars) : joined;
 }
-function stripSources(text) {
-  return (text || '').replace(/^\s*SOURCES:.*$/gim, '').trim();
+function stripSources(text = '') {
+  return text.replace(/^\s*SOURCES:.*$/gim, '').trim();
 }
 
 app.post('/api/ask', async (req, res) => {
   try {
-    const { question, mode = 'general-with-notes' } = req.body || {};
-    if (!question || !question.toString().trim()) return res.status(400).json({ error: 'Missing question' });
+    const { question } = req.body || {};
+    if (!question || !String(question).trim()) return res.status(400).json({ error: 'Missing question' });
 
-    // get userId - ideally you have middleware setting req.user. Here we try fallback to body
+    // get userId - ideally via middleware that sets req.user
     const userId = req.user?.userId || req.body.userId || null;
     if (!userId) return res.status(401).json({ error: 'No user' });
 
-    console.log('[ASK] incoming', { userId, qlen: question.length });
+    console.log('[ASK] incoming', { userId, qlen: String(question).length });
 
     let notes = [];
     if (pool) {
@@ -149,9 +156,6 @@ app.post('/api/ask', async (req, res) => {
         [userId]
       );
       notes = rows;
-    } else {
-      // no DB - use empty array
-      notes = [];
     }
 
     const context = buildContext(notes);
@@ -162,12 +166,12 @@ app.post('/api/ask', async (req, res) => {
       return res.status(500).json({ error: 'Server misconfigured (no GEMINI_API_KEY)' });
     }
 
-    const prompt = mode === 'notes-only'
-      ? `USE ONLY the following notes of the user. DO NOT use external knowledge.\nQuestion: ${question}\n\nNOTES:\n${context}\n\nIf there is not enough information in the notes, reply exactly: "No information in notes". Keep the answer short.`
-      : `You are a helpful assistant. You may use general knowledge and you have access to the following private notes as context.\nQuestion: ${question}\n\nNotes:\n${context}\n\nAnswer concisely. If you use the notes, indicate that you are referencing them.`;
-
+    const prompt = `You are a helpful assistant that may use private notes. Question: ${question}\n\nNotes:\n${context}\n\nAnswer concisely.`;
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const payload = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: Number(process.env.GEMINI_TEMPERATURE ?? 0.2), maxOutputTokens: Number(process.env.GEMINI_MAX_TOKENS ?? 1024) } };
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: Number(process.env.GEMINI_TEMPERATURE ?? 0.2), maxOutputTokens: Number(process.env.GEMINI_MAX_TOKENS ?? 1024) }
+    };
 
     const t0 = Date.now();
     const upstream = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
