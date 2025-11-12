@@ -39,30 +39,29 @@ function mapGoogleExchangeError(e) {
 
 // ——— /auth/google/exchange ———
 app.post("/auth/google/exchange", async (req, res) => {
-  try {
-    // DEBUG: loguj body przy debugowaniu (usuń/zmniejsz w prod)
-    console.log("[AUTH] POST /auth/google/exchange body:", req.body);
+try {
+  console.log("[AUTH] POST /auth/google/exchange body:", req.body);
 
-    // Akceptujemy 'code' w body form-urlencoded lub JSON lub w query
-    const code = req.body?.code ?? req.body?.authorization_code ?? req.query?.code;
-    if (!code) return res.status(400).json({ error: "missing_code" });
+  const code = req.body?.code ?? req.body?.authorization_code ?? req.query?.code;
+  if (!code) return res.status(400).json({ error: "missing_code" });
 
-    // Uwaga: redirect_uri MUSI być 'postmessage' przy wymianie kodu z GoogleSignIn (Android/iOS)
-    const oauth = new OAuth2Client({
-      clientId: CLIENT_ID,
-      clientSecret: CLIENT_SECRET,
-      redirectUri: "postmessage",
-    });
+  // Tworzony z redirectUri 'postmessage' w konstruktorze
+  const oauth = new OAuth2Client(CLIENT_ID, CLIENT_SECRET, "postmessage");
 
-    const { tokens } = await oauth.getToken({ code, redirect_uri: "postmessage" });
+  // Używamy prostego getToken(code) - biblioteka użyje redirectUri z konstruktora
+  const result = await oauth.getToken(code);
+  const tokens = result.tokens;
 
-    // tokens: { access_token, id_token, refresh_token?, expires_in, scope, token_type }
-    return res.json({ ok: true, tokens });
-  } catch (e) {
-    console.error("[AUTH] exchange failed", e?.response?.status, e?.response?.data || e);
-    const mapped = mapGoogleExchangeError(e);
-    return res.status(mapped.status).json(mapped.body);
+  if (!tokens || !tokens.id_token) {
+    return res.status(400).json({ error: "exchange_failed", detail: tokens });
   }
+
+  return res.json({ ok: true, tokens });
+} catch (e) {
+  console.error("[AUTH] exchange failed", e?.response?.status, e?.response?.data || e);
+  const mapped = mapGoogleExchangeError(e);
+  return res.status(mapped.status).json(mapped.body);
+}
 });
 
 // ——— minimalne /api/ask (przykład) ———
