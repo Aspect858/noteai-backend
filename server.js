@@ -18,12 +18,14 @@ if (!CLIENT_ID || !CLIENT_SECRET) {
 }
 
 const app = express();
-app.use(cors({ origin: "*"}));
+app.use(cors({ origin: "*" }));
+
+// <-- KLUCZOWE: obsługa JSON i form-urlencoded
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
 
 // ——— utilities ———
 function mapGoogleExchangeError(e) {
-  // przydatne logi do diagnozy bez wysadzania 500
   const code = e?.response?.status;
   const data = e?.response?.data;
   if (code === 400 && data?.error === "invalid_grant") {
@@ -36,10 +38,13 @@ function mapGoogleExchangeError(e) {
 }
 
 // ——— /auth/google/exchange ———
-// body: { code: "<serverAuthCode from Android>" }
 app.post("/auth/google/exchange", async (req, res) => {
   try {
-    const { code } = req.body || {};
+    // DEBUG: loguj body przy debugowaniu (usuń/zmniejsz w prod)
+    console.log("[AUTH] POST /auth/google/exchange body:", req.body);
+
+    // Akceptujemy 'code' w body form-urlencoded lub JSON lub w query
+    const code = req.body?.code ?? req.body?.authorization_code ?? req.query?.code;
     if (!code) return res.status(400).json({ error: "missing_code" });
 
     // Uwaga: redirect_uri MUSI być 'postmessage' przy wymianie kodu z GoogleSignIn (Android/iOS)
@@ -50,10 +55,8 @@ app.post("/auth/google/exchange", async (req, res) => {
     });
 
     const { tokens } = await oauth.getToken({ code, redirect_uri: "postmessage" });
-    // tokens: { access_token, id_token, refresh_token?, expires_in, scope, token_type }
-    // Często refresh_token pojawia się tylko przy pierwszym logowaniu lub gdy forceCodeForRefreshToken=true (u Ciebie jest true)
-    // Możesz tu zrobić lookup/create usera w DB bazując na id_token (sub)
 
+    // tokens: { access_token, id_token, refresh_token?, expires_in, scope, token_type }
     return res.json({ ok: true, tokens });
   } catch (e) {
     console.error("[AUTH] exchange failed", e?.response?.status, e?.response?.data || e);
@@ -62,36 +65,28 @@ app.post("/auth/google/exchange", async (req, res) => {
   }
 });
 
-// ——— przykładowe zabezpieczenie do /api/ask ———
-// jeśli wysyłasz idToken w nagłówku Authorization: Bearer <idToken>
+// ——— minimalne /api/ask (przykład) ———
 async function getUserFromIdToken(idToken) {
   try {
     const oauth = new OAuth2Client(CLIENT_ID);
     const ticket = await oauth.verifyIdToken({ idToken, audience: CLIENT_ID });
-    return ticket.getPayload(); // { sub, email, name, picture, ... }
+    return ticket.getPayload();
   } catch {
     return null;
   }
 }
 
 app.post("/api/ask", async (req, res) => {
-  // minimalny "auth"
   const auth = req.headers.authorization || "";
   const idToken = auth.startsWith("Bearer ") ? auth.slice(7) : null;
   const user = idToken ? await getUserFromIdToken(idToken) : null;
 
-  if (!user) {
-    // nie zabijaj 500 – frontend dostanie sensowny błąd
-    return res.status(401).json({ error: "No user" });
-  }
+  if (!user) return res.status(401).json({ error: "No user" });
 
-  // ... tutaj Twój kod do Gemini (zostawiam jak masz) ...
-  // ważne: timeouts/reties – ustaw rozsądny timeout klienta HTTP (30s) i logi odpowiedzi
-
-  return res.json({ ok: true /*, answer */ });
+  // ... tu Twój kod do Gemini ...
+  return res.json({ ok: true });
 });
 
-// health/ping
 app.get("/", (_, res) => res.status(404).send("ok"));
 app.get("/healthz", (_, res) => res.send("ok"));
 
