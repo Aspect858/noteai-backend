@@ -41,28 +41,40 @@ function mapGoogleExchangeError(e) {
 // POST /auth/google/exchange
 // body: { code: "serverAuthCode from Android" }
 app.post("/auth/google/exchange", async (req, res) => {
+  const code = req.body.code;
+  if (!code) {
+    return res.status(400).json({ ok: false, error: "missing_code" });
+  }
+
   try {
-    console.log("[AUTH] POST /auth/google/exchange body:", req.body);
-    const code = req.body?.code ?? req.body?.authorization_code ?? req.query?.code;
-    if (!code) return res.status(400).json({ error: "missing_code" });
+    const params = new URLSearchParams();
+    params.append("code", code);
+    params.append("client_id", process.env.GOOGLE_OAUTH_CLIENT_ID);
+    params.append("client_secret", process.env.GOOGLE_OAUTH_CLIENT_SECRET);
+    params.append("grant_type", "authorization_code");
+    // Dla kodów z Androida GoogleSignIn redirect_uri zazwyczaj jest "postmessage"
+    params.append("redirect_uri", "postmessage");
 
-    // ważne: podajemy 'postmessage' w konstruktorze i wywołujemy getToken(code)
-    const oauth = new OAuth2Client(CLIENT_ID, CLIENT_SECRET, "postmessage");
-    // biblioteka sama użyje redirectUri z konstruktora
-    const result = await oauth.getToken(code);
-    const tokens = result.tokens;
+    const resp = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString(),
+    });
 
-    if (!tokens || (!tokens.id_token && !tokens.access_token)) {
-      return res.status(400).json({ error: "exchange_failed", detail: tokens });
+    const tokens = await resp.json();
+    if (!resp.ok) {
+      console.error("[AUTH] Google token error", resp.status, tokens);
+      return res.status(400).json({ ok: false, error: "google_error", detail: tokens });
     }
 
+    // tutaj możesz zwrócić dalej tokeny / swój JWT
     return res.json({ ok: true, tokens });
   } catch (e) {
-    console.error("[AUTH] exchange failed", e?.response?.status, e?.response?.data || e);
-    const mapped = mapGoogleExchangeError(e);
-    return res.status(mapped.status).json(mapped.body);
+    console.error("[AUTH] exchange error", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
+
 
 // Minimalny protected endpoint (przykład)
 async function getUserFromIdToken(idToken) {
