@@ -40,42 +40,46 @@ function mapGoogleExchangeError(e) {
 
 // POST /auth/google/exchange
 // body: { code: "serverAuthCode from Android" }
-app.post("/auth/google/exchange", async (req, res) => {
-  const code = req.body.code;
+app.post('/auth/google/exchange', async (req, res) => {
+  const { code } = req.body;
+
   if (!code) {
-    return res.status(400).json({ ok: false, error: "missing_code" });
+    return res.status(400).json({ ok: false, error: 'missing_code' });
   }
 
   try {
-    const params = new URLSearchParams();
-    params.append("code", code);
-    params.append("client_id", process.env.GOOGLE_OAUTH_CLIENT_ID);
-    params.append("client_secret", process.env.GOOGLE_OAUTH_CLIENT_SECRET);
-    params.append("grant_type", "authorization_code");
-    // Dla kodów z Androida GoogleSignIn redirect_uri zazwyczaj jest "postmessage"
-    params.append("redirect_uri", "postmessage");
-
-    const resp = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: params.toString(),
+    const body = new URLSearchParams({
+      code,
+      client_id: process.env.GOOGLE_OAUTH_CLIENT_ID,
+      client_secret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+      redirect_uri: 'postmessage',          // <<< KLUCZOWE
+      grant_type: 'authorization_code',
     });
 
-    const tokens = await resp.json();
-    if (!resp.ok) {
-      console.error("[AUTH] Google token error", resp.status, tokens);
-      return res.status(400).json({ ok: false, error: "google_error", detail: tokens });
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+
+    const tokenJson = await tokenRes.json();
+    if (!tokenRes.ok) {
+      console.error('[AUTH] Google token error', tokenRes.status, tokenJson);
+      return res
+        .status(tokenRes.status)
+        .json({ ok: false, error: 'google_error', detail: tokenJson });
     }
 
-    // tutaj możesz zwrócić dalej tokeny / swój JWT
-    return res.json({ ok: true, tokens });
-  } catch (e) {
-    console.error("[AUTH] exchange error", e);
-    return res.status(500).json({ ok: false, error: "server_error" });
+    const { id_token, access_token } = tokenJson;
+
+    // tutaj Twoja logika tworzenia usera / JWT / itp.
+    // ...
+    return res.json({ ok: true, token: '...' });
+  } catch (err) {
+    console.error('[AUTH] exchange error', err);
+    return res.status(500).json({ ok: false, error: 'server_error' });
   }
 });
-
-
 // Minimalny protected endpoint (przykład)
 async function getUserFromIdToken(idToken) {
   try {
