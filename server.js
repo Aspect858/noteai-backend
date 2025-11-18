@@ -1,7 +1,6 @@
 // server.js (ESM)
 import express from "express";
 import cors from "cors";
-import bodyParser from "body-parser";
 import morgan from "morgan";
 import { OAuth2Client } from "google-auth-library";
 
@@ -20,9 +19,9 @@ if (!CLIENT_ID || !CLIENT_SECRET) {
 const app = express();
 app.use(cors({ origin: "*" }));
 app.use(morgan("dev"));
-// ⬇️ obsłuż JSON i x-www-form-urlencoded (żeby nie było 'missing_code')
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+// obsłuż JSON i form-urlencoded
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 function mapGoogleExchangeError(e) {
   const code = e?.response?.status;
@@ -39,19 +38,24 @@ function mapGoogleExchangeError(e) {
   return { status: 502, body: { error: "oauth_exchange_failed", detail: data || String(e) } };
 }
 
+// POST /auth/google/exchange
+// body: { code: "serverAuthCode from Android" }
 app.post("/auth/google/exchange", async (req, res) => {
   try {
     console.log("[AUTH] POST /auth/google/exchange body:", req.body);
     const code = req.body?.code ?? req.body?.authorization_code ?? req.query?.code;
     if (!code) return res.status(400).json({ error: "missing_code" });
 
-    // ⬇️ KLUCZ: ustaw 'postmessage' w konstruktorze i wołaj getToken(code)
+    // ważne: podajemy 'postmessage' w konstruktorze i wywołujemy getToken(code)
     const oauth = new OAuth2Client(CLIENT_ID, CLIENT_SECRET, "postmessage");
-    const { tokens } = await oauth.getToken(code);
+    // biblioteka sama użyje redirectUri z konstruktora
+    const result = await oauth.getToken(code);
+    const tokens = result.tokens;
 
-    if (!tokens?.id_token) {
+    if (!tokens || (!tokens.id_token && !tokens.access_token)) {
       return res.status(400).json({ error: "exchange_failed", detail: tokens });
     }
+
     return res.json({ ok: true, tokens });
   } catch (e) {
     console.error("[AUTH] exchange failed", e?.response?.status, e?.response?.data || e);
@@ -60,9 +64,26 @@ app.post("/auth/google/exchange", async (req, res) => {
   }
 });
 
-app.get("/healthz", (_req, res) => res.send("ok"));
-
-const listenPort = Number(PORT || 8080);
-app.listen(listenPort, () => {
-  console.log(`[BOOT] API listening on http://0.0.0.0:${listenPort}`);
+// Minimalny protected endpoint (przykład)
+async function getUserFromIdToken(idToken) {
+  try {
+    const oauth = new OAuth2Client(CLIENT_ID);
+    const ticket = await oauth.verifyIdToken({ idToken, audience: CLIENT_ID });
+    return ticket.getPayload();
+  } catch {
+    return null;
+  }
+}
+app.post("/api/ask", async (req, res) => {
+  const idToken = (req.headers.authorization || "").startsWith("Bearer ")
+    ? req.headers.authorization.slice(7)
+    : null;
+  const user = idToken ? await getUserFromIdToken(idToken) : null;
+  if (!user) return res.status(401).json({ error: "No user" });
+  // tu Twój kod do Gemini...
+  return res.json({ ok: true });
 });
+
+app.get("/healthz", (_req, res) => res.send("ok"));
+const listenPort = Number(PORT || 8080);
+app.listen(listenPort, () => console.log(`[BOOT] API listening on http://0.0.0.0:${listenPort}`));
