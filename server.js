@@ -48,14 +48,19 @@ app.post('/auth/google/exchange', async (req, res) => {
   }
 
   try {
-    const body = new URLSearchParams({
-      code,
-      client_id: process.env.GOOGLE_OAUTH_CLIENT_ID,
-      client_secret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
-      redirect_uri: 'postmessage',          // <<< KLUCZOWE
-      grant_type: 'authorization_code',
-    });
+const body = new URLSearchParams({
+  code, // kod z Androida
+  client_id: process.env.GOOGLE_OAUTH_CLIENT_ID,
+  client_secret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+  redirect_uri: "https://noteai-backend.onrender.com/auth/google/exchange",               // <<< KLUCZOWE
+  grant_type: "authorization_code",
+});
 
+    console.log("[AUTH] exchanging code", {
+  client_id: process.env.GOOGLE_OAUTH_CLIENT_ID,
+  redirect_uri: "", // tu możesz wypisać konkretną wartość
+});
+    
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
