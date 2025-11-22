@@ -4,6 +4,11 @@ import cors from "cors";
 import morgan from "morgan";
 import { OAuth2Client } from "google-auth-library";
 
+
+const { OAuth2Client } = require("google-auth-library");
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_OAUTH_CLIENT_ID);
+
 // === ENV ===
 const {
   GOOGLE_OAUTH_CLIENT_ID: CLIENT_ID,
@@ -40,45 +45,48 @@ function mapGoogleExchangeError(e) {
 
 // POST /auth/google/exchange
 // body: { code: "serverAuthCode from Android" }
-app.post('/auth/google/exchange', async (req, res) => {
-  const { code } = req.body;
-
-  if (!code) {
-    return res.status(400).json({ ok: false, error: 'missing_code' });
-  }
-
+app.post("/auth/google/exchange", async (req, res) => {
   try {
-const body = new URLSearchParams({
-  code,
-  client_id: process.env.GOOGLE_OAUTH_CLIENT_ID,
-  client_secret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
-  grant_type: "authorization_code",
-});
-    
-    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body,
-    });
-
-    const tokenJson = await tokenRes.json();
-    if (!tokenRes.ok) {
-      console.error('[AUTH] Google token error', tokenRes.status, tokenJson);
-      return res
-        .status(tokenRes.status)
-        .json({ ok: false, error: 'google_error', detail: tokenJson });
+    const { code } = req.body; // U NAS "code" = idToken z Androida
+    if (!code) {
+      return res.status(400).json({ ok: false, error: "missing_code" });
     }
 
-    const { id_token, access_token } = tokenJson;
+    // weryfikujemy ID token
+    const ticket = await googleClient.verifyIdToken({
+      idToken: code,
+      audience: process.env.GOOGLE_OAUTH_CLIENT_ID,
+    });
 
-    // tutaj Twoja logika tworzenia usera / JWT / itp.
+    const payload = ticket.getPayload();
+    if (!payload) {
+      return res
+        .status(401)
+        .json({ ok: false, error: "invalid_token_payload" });
+    }
+
+    const user = {
+      id: payload.sub,
+      email: payload.email,
+      name: payload.name || payload.email,
+      picture: payload.picture,
+    };
+
+    // tutaj możesz dopisać zapisywanie usera do DB, jeśli chcesz
     // ...
-    return res.json({ ok: true, token: '...' });
+
+    return res.json({ ok: true, user });
   } catch (err) {
-    console.error('[AUTH] exchange error', err);
-    return res.status(500).json({ ok: false, error: 'server_error' });
+    console.error(
+      "[AUTH] Google token verify error",
+      err && err.response ? await err.response.text?.() : err
+    );
+    return res
+      .status(401)
+      .json({ ok: false, error: "google_error" });
   }
 });
+
 // Minimalny protected endpoint (przykład)
 async function getUserFromIdToken(idToken) {
   try {
