@@ -1,107 +1,203 @@
-// server.js (ESM)
+// server.js – backend dla NoteAI (Render, Node 22, ESM)
+
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
 
-const { OAuth2Client } = require("google-auth-library");
-
-// === ENV ===
-const {
-  GOOGLE_OAUTH_CLIENT_ID: CLIENT_ID,
-  GOOGLE_OAUTH_CLIENT_SECRET: CLIENT_SECRET,
-  PORT,
-} = process.env;
-
-if (!CLIENT_ID || !CLIENT_SECRET) {
-  console.error("[BOOT] Missing GOOGLE_OAUTH_CLIENT_ID or GOOGLE_OAUTH_CLIENT_SECRET");
-  process.exit(1);
-}
-
 const app = express();
-app.use(cors({ origin: "*" }));
-app.use(morgan("dev"));
-// obsłuż JSON i form-urlencoded
+
+// ─────────────────────  MIDDLEWARE  ─────────────────────
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(
+  cors({
+    origin: "*", // dla prostoty; możesz zawęzić do swojej appki / domeny
+  }),
+);
+app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-function mapGoogleExchangeError(e) {
-  const code = e?.response?.status;
-  const data = e?.response?.data;
-  if (code === 400 && data?.error === "invalid_grant") {
-    return { status: 400, body: { error: "invalid_grant", detail: data } };
-  }
-  if (code === 400 && data?.error === "redirect_uri_mismatch") {
-    return { status: 400, body: { error: "redirect_uri_mismatch", detail: data } };
-  }
-  if (code === 401) {
-    return { status: 401, body: { error: "unauthorized_client", detail: data } };
-  }
-  return { status: 502, body: { error: "oauth_exchange_failed", detail: data || String(e) } };
+// ─────────────────────  HEALTHCHECK  ─────────────────────
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+// ─────────────────────  GOOGLE OAUTH  ─────────────────────
+
+// Ustawione w Render → Environment
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+
+if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+  console.warn(
+    "[AUTH] Brakuje GOOGLE_OAUTH_CLIENT_ID lub GOOGLE_OAUTH_CLIENT_SECRET w Environment na Renderze",
+  );
 }
 
-// POST /auth/google/exchange
-// body: { code: "serverAuthCode from Android" }
+/**
+ * POST /auth/google/exchange
+ * Body: { code: string }
+ * Zwraca: { ok: true, user, token } lub błąd
+ */
 app.post("/auth/google/exchange", async (req, res) => {
-  try {
-    const { code } = req.body; // U NAS "code" = idToken z Androida
-    if (!code) {
-      return res.status(400).json({ ok: false, error: "missing_code" });
-    }
+  const { code } = req.body ?? {};
 
-    // weryfikujemy ID token
-    const ticket = await googleClient.verifyIdToken({
-      idToken: code,
-      audience: process.env.GOOGLE_OAUTH_CLIENT_ID,
+  if (!code) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "missing_code", detail: "Brak pola 'code' w body" });
+  }
+
+  try {
+    // 1) wymiana code -> tokeny
+    const tokenResp = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        grant_type: "authorization_code",
+        // NIE podajemy redirect_uri – Androidowe "Installed app" tego nie wymaga
+      }),
     });
 
-    const payload = ticket.getPayload();
-    if (!payload) {
+    const tokenJson = await tokenResp.json();
+
+    if (!tokenResp.ok) {
+      console.error("[AUTH] Google token error", tokenJson);
       return res
-        .status(401)
-        .json({ ok: false, error: "invalid_token_payload" });
+        .status(400)
+        .json({ ok: false, error: "google_error", detail: tokenJson });
+    }
+
+    const { access_token, id_token } = tokenJson;
+
+    // 2) pobranie danych użytkownika
+    const userResp = await fetch(
+      "https://www.googleapis.com/oauth2/v3/userinfo",
+      {
+        headers: { Authorization: `Bearer ${access_token}` },
+      },
+    );
+    const userJson = await userResp.json();
+
+    if (!userResp.ok) {
+      console.error("[AUTH] Google userinfo error", userJson);
+      return res
+        .status(400)
+        .json({ ok: false, error: "google_userinfo_error", detail: userJson });
     }
 
     const user = {
-      id: payload.sub,
-      email: payload.email,
-      name: payload.name || payload.email,
-      picture: payload.picture,
+      id: userJson.sub,
+      email: userJson.email,
+      name: userJson.name,
+      picture: userJson.picture,
     };
 
-    // tutaj możesz dopisać zapisywanie usera do DB, jeśli chcesz
-    // ...
+    console.log("[AUTH] Login OK:", user.email);
 
-    return res.json({ ok: true, user });
+    // Tu możesz ew. zapisać usera w bazie (Neon) – login działa bez tego.
+    return res.json({
+      ok: true,
+      token: id_token ?? access_token,
+      user,
+    });
   } catch (err) {
-    console.error(
-      "[AUTH] Google token verify error",
-      err && err.response ? await err.response.text?.() : err
-    );
+    console.error("[AUTH] exchange failed", err);
     return res
-      .status(401)
-      .json({ ok: false, error: "google_error" });
+      .status(500)
+      .json({ ok: false, error: "server_error", detail: "Internal error" });
   }
 });
 
-// Minimalny protected endpoint (przykład)
-async function getUserFromIdToken(idToken) {
-  try {
-    const ticket = await oauth.verifyIdToken({ idToken, audience: CLIENT_ID });
-    return ticket.getPayload();
-  } catch {
-    return null;
-  }
+// ─────────────────────  GEMINI /api/ask  ─────────────────────
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+const GEMINI_TEMPERATURE = Number(process.env.GEMINI_TEMPERATURE || "0.2");
+const GEMINI_MAX_TOKENS = Number(process.env.GEMINI_MAX_TOKENS || "1024");
+
+if (!GEMINI_API_KEY) {
+  console.warn(
+    "[GEMINI] Brak GEMINI_API_KEY – endpoint /api/ask będzie zwracał błąd",
+  );
 }
+
+/**
+ * POST /api/ask
+ * Body: { userId?: string, question: string }
+ */
 app.post("/api/ask", async (req, res) => {
-  const idToken = (req.headers.authorization || "").startsWith("Bearer ")
-    ? req.headers.authorization.slice(7)
-    : null;
-  const user = idToken ? await getUserFromIdToken(idToken) : null;
-  if (!user) return res.status(401).json({ error: "No user" });
-  // tu Twój kod do Gemini...
-  return res.json({ ok: true });
+  if (!GEMINI_API_KEY) {
+    return res
+      .status(500)
+      .json({ ok: false, error: "missing_gemini_key" });
+  }
+
+  const { userId, question } = req.body ?? {};
+
+  if (!question) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "missing_question" });
+  }
+
+  try {
+    const prompt = `
+You are Notes Assistant for an Android notebook app.
+User id (may be empty): ${userId || "anonymous"}.
+User question: ${question}
+Answer concisely in Polish unless user clearly uses another language.
+`;
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      GEMINI_MODEL,
+    )}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
+    const gResp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: prompt }],
+          },
+        ],
+        generationConfig: {
+          temperature: GEMINI_TEMPERATURE,
+          maxOutputTokens: GEMINI_MAX_TOKENS,
+        },
+      }),
+    });
+
+    const gJson = await gResp.json();
+
+    if (!gResp.ok) {
+      console.error("[GEMINI] API error", gJson);
+      return res
+        .status(500)
+        .json({ ok: false, error: "gemini_error", detail: gJson });
+    }
+
+    const text =
+      gJson.candidates?.[0]?.content?.parts?.[0]?.text ??
+      "(Brak odpowiedzi od Gemini)";
+
+    return res.json({ ok: true, answer: text });
+  } catch (err) {
+    console.error("[GEMINI] RAG failed", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: "server_error" });
+  }
 });
 
-app.get("/healthz", (_req, res) => res.send("ok"));
-const listenPort = Number(PORT || 8080);
-app.listen(listenPort, () => console.log(`[BOOT] API listening on http://0.0.0.0:${listenPort}`));
+// ─────────────────────  START SERWERA  ─────────────────────
+
+const PORT = Number(process.env.PORT || 8080);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`[BOOT] API listening on http://0.0.0.0:${PORT}`);
+});
