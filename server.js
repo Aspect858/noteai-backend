@@ -1,9 +1,12 @@
 // server.js – backend dla NoteAI (Render, Node 22, ESM)
 
-import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
+import { OAuth2Client } from "google-auth-library";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const app = express();
 
