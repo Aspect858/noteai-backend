@@ -2,12 +2,8 @@
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
-import { OAuth2Client } from "google-auth-library";
-
 
 const { OAuth2Client } = require("google-auth-library");
-
-const googleClient = new OAuth2Client(process.env.GOOGLE_OAUTH_CLIENT_ID);
 
 // === ENV ===
 const {
@@ -90,7 +86,6 @@ app.post("/auth/google/exchange", async (req, res) => {
 // Minimalny protected endpoint (przykład)
 async function getUserFromIdToken(idToken) {
   try {
-    const oauth = new OAuth2Client(CLIENT_ID);
     const ticket = await oauth.verifyIdToken({ idToken, audience: CLIENT_ID });
     return ticket.getPayload();
   } catch {
