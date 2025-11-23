@@ -43,77 +43,43 @@ if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
  * Zwraca: { ok: true, user, token } lub błąd
  */
 app.post("/auth/google/exchange", async (req, res) => {
-  const { code } = req.body ?? {};
+  const { code } = req.body; // to musi być serverAuthCode z Androida
 
   if (!code) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "missing_code", detail: "Brak pola 'code' w body" });
+    return res.status(400).json({ ok: false, error: "missing_code" });
   }
 
   try {
-    // 1) wymiana code -> tokeny
-    const tokenResp = await fetch("https://oauth2.googleapis.com/token", {
+    const body = new URLSearchParams({
+      code,
+      client_id: process.env.GOOGLE_OAUTH_CLIENT_ID,
+      client_secret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+      grant_type: "authorization_code",
+      // redirect_uri NIE wysyłamy dla aplikacji zainstalowanych
+    });
+
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        code,
-        client_id: GOOGLE_CLIENT_ID,
-        client_secret: GOOGLE_CLIENT_SECRET,
-        grant_type: "authorization_code",
-        // NIE podajemy redirect_uri – Androidowe "Installed app" tego nie wymaga
-      }),
+      body
     });
 
-    const tokenJson = await tokenResp.json();
-
-    if (!tokenResp.ok) {
-      console.error("[AUTH] Google token error", tokenJson);
-      return res
-        .status(400)
-        .json({ ok: false, error: "google_error", detail: tokenJson });
+    const tokens = await tokenRes.json();
+    if (!tokenRes.ok) {
+      console.error("[AUTH] Google token error", tokens);
+      return res.status(400).json({ ok: false, error: "google_error", detail: tokens });
     }
 
-    const { access_token, id_token } = tokenJson;
+    const idToken = tokens.id_token; // stąd bierzesz email, sub itd.
+    // ... logika użytkownika w DB ...
+    return res.json({ ok: true, /* twój token, user itd. */ });
 
-    // 2) pobranie danych użytkownika
-    const userResp = await fetch(
-      "https://www.googleapis.com/oauth2/v3/userinfo",
-      {
-        headers: { Authorization: `Bearer ${access_token}` },
-      },
-    );
-    const userJson = await userResp.json();
-
-    if (!userResp.ok) {
-      console.error("[AUTH] Google userinfo error", userJson);
-      return res
-        .status(400)
-        .json({ ok: false, error: "google_userinfo_error", detail: userJson });
-    }
-
-    const user = {
-      id: userJson.sub,
-      email: userJson.email,
-      name: userJson.name,
-      picture: userJson.picture,
-    };
-
-    console.log("[AUTH] Login OK:", user.email);
-
-    // Tu możesz ew. zapisać usera w bazie (Neon) – login działa bez tego.
-    return res.json({
-      ok: true,
-      token: id_token ?? access_token,
-      user,
-    });
-  } catch (err) {
-    console.error("[AUTH] exchange failed", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: "server_error", detail: "Internal error" });
+  } catch (e) {
+    console.error("[AUTH] exchange failed", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
+
 
 // ─────────────────────  GEMINI /api/ask  ─────────────────────
 
