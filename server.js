@@ -1,4 +1,4 @@
-// server.js — backend dla NoteAI (Render, Node 22, ESM)
+// server.js — backend dla NoteAI (Render, Node 22+, ESM)
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
@@ -11,14 +11,14 @@ dotenv.config();
 
 const app = express();
 
-// MIDDLEWARE
+// ─────────────────────  MIDDLEWARE  ─────────────────────
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-// Na start można zostawić origin: "*", ale w prod ogranicz do zaufanych originów
+// Na start możesz zostawić origin: "*", ale w produkcji ogranicz do zaufanych originów
 app.use(cors({ origin: "*" }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-// ENV / CONFIG
+// ─────────────────────  ENV / CONFIG  ─────────────────────
 const {
   GOOGLE_OAUTH_CLIENT_ID,
   GOOGLE_OAUTH_CLIENT_SECRET,
@@ -32,42 +32,48 @@ const {
   SERVER_JWT_SECRET
 } = process.env;
 
-// JWT secret
-const JWT_SECRET = SERVER_JWT_SECRET || process.env.JWT_SECRET || crypto.randomBytes(32).toString("hex");
-if (!process.env.SERVER_JWT_SECRET) {
+const JWT_SECRET = SERVER_JWT_SECRET || crypto.randomBytes(32).toString("hex");
+if (!SERVER_JWT_SECRET) {
   console.warn("[BOOT] SERVER_JWT_SECRET not set — using ephemeral secret (not for production).");
 }
-
 if (!GOOGLE_OAUTH_CLIENT_ID) {
   console.warn("[BOOT] GOOGLE_OAUTH_CLIENT_ID not set — Google OAuth will fail.");
 }
+if (!GOOGLE_OAUTH_CLIENT_SECRET) {
+  console.warn("[BOOT] GOOGLE_OAUTH_CLIENT_SECRET not set — Google token exchange will fail.");
+}
 
-// OAUTH2 client (do wymiany code => token + verify id_token)
+// ─────────────────────  OAUTH / GOOGLE AUTH  ─────────────────────
+// OAuth2Client do wymiany code -> token i weryfikacji id_token
 const oauth2Client = new OAuth2Client(GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET);
 
-// GoogleAuth for Gemini (service account) — preferowane
+// GoogleAuth do pobierania tokenu serwisowego dla Gemini (preferowane)
 let googleAuth;
 try {
-  const googleAuthCfg = { scopes: ["https://www.googleapis.com/auth/cloud-platform"] };
+  const gaConfig = { scopes: ["https://www.googleapis.com/auth/cloud-platform"] };
   if (GOOGLE_SERVICE_ACCOUNT_JSON) {
     try {
-      googleAuthCfg.credentials = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
-      console.log("[BOOT] Using GOOGLE_SERVICE_ACCOUNT_JSON for GoogleAuth (parsed).");
+      gaConfig.credentials = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
+      console.log("[BOOT] Parsed GOOGLE_SERVICE_ACCOUNT_JSON (using embedded service account).");
     } catch (err) {
-      console.warn("[BOOT] Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON:", err.message);
-      // fallthrough to default ADC (if set in env as path) or to API_KEY fallback
+      console.warn("[BOOT] GOOGLE_SERVICE_ACCOUNT_JSON provided but failed to parse:", err.message);
+      // pozwól GoogleAuth użyć ADC (np. GOOGLE_APPLICATION_CREDENTIALS) lub fallback na API key
     }
   }
-  googleAuth = new GoogleAuth(googleAuthCfg);
+  googleAuth = new GoogleAuth(gaConfig);
 } catch (err) {
   console.warn("[BOOT] GoogleAuth init failed:", err.message);
   googleAuth = new GoogleAuth({ scopes: ["https://www.googleapis.com/auth/cloud-platform"] });
 }
 
-// Healthcheck
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// ─────────────────────  HEALTHCHECK  ─────────────────────
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
 
-// Auth config — klient mobilny wywoła to aby pobrać webClientId / androidClientId / redirectUri
+// ─────────────────────  GOOGLE OAUTH  ─────────────────────
+
+// GET /auth/config — klient mobilny pobiera publiczne clientId (web + android)
 app.get("/auth/config", (_req, res) => {
   return res.json({
     webClientId: GOOGLE_OAUTH_CLIENT_ID || null,
@@ -76,8 +82,11 @@ app.get("/auth/config", (_req, res) => {
   });
 });
 
-// POST /auth/google/exchange
-// body: { code: string }  <-- serverAuthCode z Androida (requestServerAuthCode)
+/**
+ * POST /auth/google/exchange
+ * Body: { code: string }  // serverAuthCode z Androida (requestServerAuthCode)
+ * Zwraca: { ok: true, user, token } lub błąd
+ */
 app.post("/auth/google/exchange", async (req, res) => {
   const { code } = req.body ?? {};
   if (!code) {
@@ -85,7 +94,7 @@ app.post("/auth/google/exchange", async (req, res) => {
   }
 
   try {
-    // getToken obsłuży wymianę na access_token, id_token, refresh_token (jeśli dostępne)
+    // wymiana kodu na tokeny (access_token, id_token, refresh_token)
     const r = await oauth2Client.getToken(code);
     const tokens = r.tokens || {};
     const idToken = tokens.id_token;
@@ -95,14 +104,14 @@ app.post("/auth/google/exchange", async (req, res) => {
       return res.status(400).json({ ok: false, error: "no_id_token", detail: tokens });
     }
 
-    // Verify id_token and extract payload
+    // weryfikacja id_token
     const ticket = await oauth2Client.verifyIdToken({
       idToken,
       audience: GOOGLE_OAUTH_CLIENT_ID
     });
     const payload = ticket.getPayload() || {};
 
-    // Build user object (customize to your DB schema)
+    // prosty obiekt użytkownika — dostosuj do Twojej bazy
     const user = {
       sub: payload.sub,
       email: payload.email,
@@ -111,25 +120,22 @@ app.post("/auth/google/exchange", async (req, res) => {
       locale: payload.locale || null
     };
 
-    // Create our own JWT session token (or use DB to create session)
-    const sessionToken = jwt.sign({
-      sub: user.sub,
-      email: user.email,
-      name: user.name
-    }, JWT_SECRET, { expiresIn: "30d" });
+    // generujemy własny JWT (lub zamiast tego zapisz session w DB)
+    const sessionToken = jwt.sign(
+      { sub: user.sub, email: user.email, name: user.name },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
 
-    // TODO: tutaj zapisz użytkownika w DB lub utwórz realną sesję (DB lub Redis)
-    // Dla prostoty zwracamy user + token
+    // TODO: zapisz użytkownika w DB / utwórz realną sesję — tutaj zwracamy tylko demo token
     return res.json({ ok: true, user, token: sessionToken });
-
   } catch (err) {
     console.error("[AUTH] exchange failed:", err);
-    // Jeśli Google zwraca 400/401 -> pokaż szczegóły w logach, ale w odpowiedzi ogólny błąd
     return res.status(500).json({ ok: false, error: "server_error", detail: err.message });
   }
 });
 
-// GET /auth/me — zwróć obecną sesję (Authorization: Bearer <token>)
+// GET /auth/me — wymaga Authorization: Bearer <token>
 app.get("/auth/me", (req, res) => {
   try {
     const auth = req.header("Authorization") || "";
@@ -143,34 +149,34 @@ app.get("/auth/me", (req, res) => {
   }
 });
 
-// POST /auth/logout (opcjonalne)
+// POST /auth/logout
 app.post("/auth/logout", (_req, res) => {
-  // Jeśli trzymasz sesje w DB: usuń. Jeśli JWT — klient po prostu usuwa token.
+  // Jeśli implementujesz sesje w DB: usuń tutaj sesję.
   return res.json({ ok: true });
 });
 
-// POST /api/ask — Gemini
-// body: { userId?: string, question: string }
+// ─────────────────────  GEMINI /api/ask  ─────────────────────
+/**
+ * POST /api/ask
+ * Body: { userId?: string, question: string }
+ */
 app.post("/api/ask", async (req, res) => {
   const { userId, question } = req.body ?? {};
   if (!question) {
     return res.status(400).json({ ok: false, error: "missing_question" });
   }
 
-  // Preferujemy service account (GoogleAuth + Bearer token). Fallback: API key (GEMINI_API_KEY)
   try {
+    // Preferujemy service account + Bearer token
     let accessToken = null;
-
-    // jeśli googleAuth ma credentials (service account) lub ADC jest ustawione, pobierz token
     try {
       const client = await googleAuth.getClient();
       const t = await client.getAccessToken();
-      accessToken = (t && t.token) ? t.token : t;
+      accessToken = (t && typeof t === "object") ? t.token : t; // getAccessToken może zwracać { token } lub string
     } catch (err) {
-      console.warn("[GEMINI] Could not get service account token:", err.message);
+      console.warn("[GEMINI] Could not obtain service account token:", err.message);
     }
 
-    // Jeśli nie udało się uzyskać access token, sprawdź fallback na API key
     const useApiKey = !accessToken && GEMINI_API_KEY;
     if (!accessToken && !useApiKey) {
       console.error("[GEMINI] No credentials for Gemini: set GOOGLE_SERVICE_ACCOUNT_JSON or GEMINI_API_KEY");
@@ -186,9 +192,7 @@ Answer concisely in Polish unless user clearly uses another language.
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent${useApiKey ? `?key=${encodeURIComponent(GEMINI_API_KEY)}` : ""}`;
 
-    const headers = {
-      "Content-Type": "application/json"
-    };
+    const headers = { "Content-Type": "application/json" };
     if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
 
     const gResp = await fetch(url, {
@@ -209,7 +213,6 @@ Answer concisely in Polish unless user clearly uses another language.
     });
 
     const gJson = await gResp.json();
-
     if (!gResp.ok) {
       console.error("[GEMINI] API error", gJson);
       return res.status(500).json({ ok: false, error: "gemini_error", detail: gJson });
@@ -217,13 +220,14 @@ Answer concisely in Polish unless user clearly uses another language.
 
     const text = gJson?.candidates?.[0]?.content?.parts?.[0]?.text ?? "(Brak odpowiedzi od Gemini)";
     return res.json({ ok: true, answer: text });
-
   } catch (err) {
     console.error("[GEMINI] request failed", err);
     return res.status(500).json({ ok: false, error: "server_error", detail: err.message });
   }
 });
 
-// START
+// ─────────────────────  START SERWERA  ─────────────────────
 const PORT = Number(process.env.PORT || 8080);
-app.listen(PORT, "0.0.0.0", () => console.log(`[BOOT] API listening on http://0.0.0.0:${PORT}`));
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`[BOOT] API listening on http://0.0.0.0:${PORT}`);
+});
