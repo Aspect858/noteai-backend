@@ -111,14 +111,16 @@ app.post("/auth/google/exchange", async (req, res) => {
     });
     const payload = ticket.getPayload() || {};
 
-    // prosty obiekt użytkownika — dostosuj do Twojej bazy
-    const user = {
-      sub: payload.sub,
-      email: payload.email,
-      name: payload.name,
-      picture: payload.picture || null,
-      locale: payload.locale || null
-    };
+// prosty obiekt użytkownika — dostosuj do Twojej bazy
+const user = {
+  id: payload.sub,
+  sub: payload.sub,
+  email: payload.email,
+  name: payload.name,
+  picture: payload.picture || null,
+  locale: payload.locale || null
+};
+
 
     // generujemy własny JWT (lub zamiast tego zapisz session w DB)
     const sessionToken = jwt.sign(
